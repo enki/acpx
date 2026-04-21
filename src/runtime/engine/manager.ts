@@ -253,6 +253,7 @@ function statusSummary(record: SessionRecord): string {
 export class AcpRuntimeManager {
   private readonly activeControllers = new Map<string, ActiveSessionController>();
   private readonly pendingPersistentClients = new Map<string, AcpClient>();
+  private readonly closingActiveRecords = new Set<string>();
 
   constructor(
     private readonly options: AcpRuntimeOptions,
@@ -280,6 +281,48 @@ export class AcpRuntimeManager {
       this.pendingPersistentClients.delete(record.acpxRecordId);
     }
     return pendingClient;
+  }
+
+  private async closePendingPersistentClient(recordId: string): Promise<void> {
+    const pendingClient = this.pendingPersistentClients.get(recordId);
+    if (!pendingClient) {
+      return;
+    }
+    this.pendingPersistentClients.delete(recordId);
+    await pendingClient.close().catch(() => {});
+  }
+
+  private async refreshClosedState(record: SessionRecord): Promise<boolean> {
+    if (!this.closingActiveRecords.has(record.acpxRecordId)) {
+      return record.closed === true;
+    }
+    const latest = await this.options.sessionStore.load(record.acpxRecordId).catch(() => undefined);
+    record.closed = true;
+    record.closedAt = latest?.closedAt ?? record.closedAt ?? isoNow();
+    if (latest?.acpx) {
+      record.acpx = {
+        ...record.acpx,
+        ...latest.acpx,
+      };
+    }
+    return true;
+  }
+
+  private async retainPersistentClientAfterTurn(input: {
+    record: SessionRecord;
+    client: AcpClient;
+  }): Promise<boolean> {
+    const { record, client } = input;
+    const isPersistentRecord = !record.acpxRecordId.includes(":oneshot:");
+    if (!isPersistentRecord || record.closed || !client.hasReusableSession(record.acpSessionId)) {
+      return false;
+    }
+    const previousClient = this.pendingPersistentClients.get(record.acpxRecordId);
+    this.pendingPersistentClients.set(record.acpxRecordId, client);
+    if (previousClient && previousClient !== client) {
+      await previousClient.close().catch(() => {});
+    }
+    return true;
   }
 
   private async withRuntimeControlSession<T>(
@@ -343,6 +386,7 @@ export class AcpRuntimeManager {
     ) {
       existing.closed = false;
       existing.closedAt = undefined;
+      this.closingActiveRecords.delete(existing.acpxRecordId);
       await this.options.sessionStore.save(existing);
       return existing;
     }
@@ -378,6 +422,7 @@ export class AcpRuntimeManager {
         cwd,
         agentSessionId,
       });
+      this.closingActiveRecords.delete(record.acpxRecordId);
       record.protocolVersion = client.initializeResult?.protocolVersion;
       record.agentCapabilities = client.initializeResult?.agentCapabilities;
       applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
@@ -654,10 +699,8 @@ export class AcpRuntimeManager {
         if (input.signal) {
           input.signal.removeEventListener("abort", abortHandler);
         }
-        if (record) {
-          this.activeControllers.delete(record.acpxRecordId);
-        }
         client?.clearEventHandlers();
+        let pooled = false;
         if (record && conversation) {
           applyLifecycleSnapshotToRecord(
             record,
@@ -666,9 +709,19 @@ export class AcpRuntimeManager {
           record.acpx = acpxState;
           applyConversation(record, conversation);
           record.lastUsedAt = isoNow();
+          const closed = await this.refreshClosedState(record);
           await this.options.sessionStore.save(record).catch(() => {});
+          if (!closed && client) {
+            pooled = await this.retainPersistentClientAfterTurn({ record, client });
+          }
         }
-        await client?.close().catch(() => {});
+        if (!pooled) {
+          await client?.close().catch(() => {});
+        }
+        if (record) {
+          this.activeControllers.delete(record.acpxRecordId);
+          this.closingActiveRecords.delete(record.acpxRecordId);
+        }
         queue.close();
       }
     })();
@@ -785,6 +838,9 @@ export class AcpRuntimeManager {
     options: { discardPersistentState?: boolean } = {},
   ): Promise<void> {
     const record = await this.requireRecord(handle.acpxRecordId ?? handle.sessionKey);
+    if (this.activeControllers.has(record.acpxRecordId)) {
+      this.closingActiveRecords.add(record.acpxRecordId);
+    }
     await this.cancel(handle);
     if (options.discardPersistentState) {
       await this.closeBackendSession(record);
@@ -792,6 +848,8 @@ export class AcpRuntimeManager {
         ...record.acpx,
         reset_on_next_ensure: true,
       };
+    } else {
+      await this.closePendingPersistentClient(record.acpxRecordId);
     }
     record.closed = true;
     record.closedAt = isoNow();
