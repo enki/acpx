@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
 import { randomUUID } from "node:crypto";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { resolve } from "node:path";
 import { Readable, Writable } from "node:stream";
 import {
   AgentSideConnection,
@@ -11,6 +14,7 @@ import {
   type AgentSideConnection as AgentConnection,
   type ContentBlock,
   type InitializeResponse,
+  type NewSessionRequest,
   type LoadSessionRequest,
   type LoadSessionResponse,
   type NewSessionResponse,
@@ -56,6 +60,27 @@ type SessionState = {
   configValues: Record<string, string | boolean>;
   transientPromptAttempts: Record<string, number>;
   modelId: string;
+  lastAssistantMessage?: string;
+  mcpServers?: SessionMcpServer[];
+};
+
+type PersistedSessionState = {
+  hasCompletedPrompt: boolean;
+  modeId: string;
+  configValues: Record<string, string | boolean>;
+  transientPromptAttempts: Record<string, number>;
+  modelId: string;
+  lastAssistantMessage?: string;
+};
+
+type SessionMcpServer = {
+  name?: string;
+  type?: string;
+  url?: string;
+  headers?: Array<{
+    name?: string;
+    value?: string;
+  }>;
 };
 
 class CancelledError extends Error {
@@ -444,6 +469,118 @@ function createSessionState(hasCompletedPrompt = false): SessionState {
   };
 }
 
+function normalizeSessionMcpServers(value: unknown): SessionMcpServer[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .filter(
+      (entry): entry is Record<string, unknown> => typeof entry === "object" && entry !== null,
+    )
+    .map((entry) => ({
+      ...(typeof entry.name === "string" ? { name: entry.name } : {}),
+      ...(typeof entry.type === "string" ? { type: entry.type } : {}),
+      ...(typeof entry.url === "string" ? { url: entry.url } : {}),
+      ...(Array.isArray(entry.headers)
+        ? {
+            headers: entry.headers
+              .filter(
+                (header): header is Record<string, unknown> =>
+                  typeof header === "object" && header !== null,
+              )
+              .map((header) => ({
+                ...(typeof header.name === "string" ? { name: header.name } : {}),
+                ...(typeof header.value === "string" ? { value: header.value } : {}),
+              })),
+          }
+        : {}),
+    }));
+}
+
+const SESSION_STATE_DIR = resolve(tmpdir(), "acpx-mock-agent-state");
+
+function buildSessionStatePath(sessionId: SessionId): string {
+  return resolve(SESSION_STATE_DIR, `${sessionId}.json`);
+}
+
+function toPersistedSessionState(session: SessionState): PersistedSessionState {
+  return {
+    hasCompletedPrompt: session.hasCompletedPrompt,
+    modeId: session.modeId,
+    configValues: { ...session.configValues },
+    transientPromptAttempts: { ...session.transientPromptAttempts },
+    modelId: session.modelId,
+    ...(session.lastAssistantMessage !== undefined
+      ? { lastAssistantMessage: session.lastAssistantMessage }
+      : {}),
+  };
+}
+
+async function persistSessionState(sessionId: SessionId, session: SessionState): Promise<void> {
+  await mkdir(SESSION_STATE_DIR, { recursive: true });
+  await writeFile(
+    buildSessionStatePath(sessionId),
+    JSON.stringify(toPersistedSessionState(session)),
+    "utf8",
+  );
+}
+
+async function readPersistedSessionState(sessionId: SessionId): Promise<SessionState | null> {
+  try {
+    const raw = await readFile(buildSessionStatePath(sessionId), "utf8");
+    const parsed = JSON.parse(raw) as Partial<PersistedSessionState>;
+    return {
+      hasCompletedPrompt: parsed.hasCompletedPrompt === true,
+      modeId: typeof parsed.modeId === "string" ? parsed.modeId : "auto",
+      modelId: typeof parsed.modelId === "string" ? parsed.modelId : DEFAULT_MODEL_ID,
+      configValues:
+        parsed.configValues &&
+        typeof parsed.configValues === "object" &&
+        !Array.isArray(parsed.configValues)
+          ? { ...parsed.configValues }
+          : { reasoning_effort: "medium" },
+      transientPromptAttempts:
+        parsed.transientPromptAttempts &&
+        typeof parsed.transientPromptAttempts === "object" &&
+        !Array.isArray(parsed.transientPromptAttempts)
+          ? Object.fromEntries(
+              Object.entries(parsed.transientPromptAttempts).filter(
+                ([, value]) => typeof value === "number" && Number.isFinite(value),
+              ),
+            )
+          : {},
+      ...(typeof parsed.lastAssistantMessage === "string"
+        ? { lastAssistantMessage: parsed.lastAssistantMessage }
+        : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function resolveNaturalLanguagePrompt(session: SessionState, text: string): string | null {
+  const singleWordMatch =
+    /^Reply with(?: exactly)? the single word ([A-Za-z0-9_-]+) and nothing else\.$/.exec(text);
+  if (singleWordMatch) {
+    return singleWordMatch[1];
+  }
+
+  if (
+    text ===
+      "What single word did you reply with immediately before this message in this same session? Reply with that word only." ||
+    text ===
+      "What single word did you reply with before this in this same session? Reply with that word only."
+  ) {
+    return session.lastAssistantMessage ?? "";
+  }
+
+  if (text === "Reply briefly once this prompt and image are received. Do not use tools.") {
+    return "received image";
+  }
+
+  return null;
+}
+
 function buildConfigOptions(state: SessionState): SetSessionConfigOptionResponse["configOptions"] {
   const reasoningEffort =
     typeof state.configValues.reasoning_effort === "string"
@@ -507,7 +644,12 @@ class MockAgent implements Agent {
     return {
       protocolVersion: PROTOCOL_VERSION,
       authMethods: [],
-      agentCapabilities: this.options.supportsLoadSession ? { loadSession: true } : {},
+      agentCapabilities: {
+        ...(this.options.supportsLoadSession ? { loadSession: true } : {}),
+        sessionCapabilities: {
+          close: {},
+        },
+      },
     };
   }
 
@@ -515,13 +657,16 @@ class MockAgent implements Agent {
     return;
   }
 
-  async newSession(): Promise<NewSessionResponse> {
+  async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
     if (this.options.hangOnNewSession) {
       return await new Promise<NewSessionResponse>(() => {});
     }
 
     const sessionId = randomUUID();
-    this.sessions.set(sessionId, createSessionState(false));
+    const session = createSessionState(false);
+    session.mcpServers = normalizeSessionMcpServers(params.mcpServers);
+    this.sessions.set(sessionId, session);
+    await persistSessionState(sessionId, session);
 
     const response: NewSessionResponse = { sessionId };
 
@@ -545,7 +690,8 @@ class MockAgent implements Agent {
       throw RequestError.resourceNotFound(params.sessionId);
     }
 
-    const existing = this.sessions.get(params.sessionId);
+    const existing =
+      this.sessions.get(params.sessionId) ?? (await readPersistedSessionState(params.sessionId));
     if (this.options.loadSessionFailsOnEmpty && (!existing || !existing.hasCompletedPrompt)) {
       const error = new Error("Internal error") as Error & {
         code: number;
@@ -560,7 +706,10 @@ class MockAgent implements Agent {
       throw error;
     }
 
-    this.sessions.set(params.sessionId, existing ?? createSessionState(false));
+    const restored = existing ?? createSessionState(false);
+    restored.mcpServers = normalizeSessionMcpServers(params.mcpServers);
+    this.sessions.set(params.sessionId, restored);
+    await persistSessionState(params.sessionId, restored);
 
     if (this.options.replayLoadSessionUpdates) {
       await this.sendAssistantMessage(params.sessionId, this.options.loadReplayText);
@@ -640,8 +789,10 @@ class MockAgent implements Agent {
       const response =
         text === "inspect-prompt"
           ? describePromptBlocks(params.prompt)
-          : await this.handlePrompt(params.sessionId, text, promptAbort.signal);
+          : await this.handlePrompt(params.sessionId, session, text, promptAbort.signal);
       session.hasCompletedPrompt = true;
+      session.lastAssistantMessage = response;
+      await persistSessionState(params.sessionId, session);
       await this.sendAssistantMessage(params.sessionId, response);
       return { stopReason: "end_turn" };
     } catch (error) {
@@ -660,6 +811,11 @@ class MockAgent implements Agent {
 
   async cancel(params: { sessionId: SessionId }): Promise<void> {
     this.sessions.get(params.sessionId)?.pendingPrompt?.abort();
+  }
+
+  async unstable_closeSession(params: { sessionId: SessionId }): Promise<Record<string, never>> {
+    this.sessions.delete(params.sessionId);
+    return {};
   }
 
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
@@ -683,6 +839,7 @@ class MockAgent implements Agent {
       throw new Error("setSessionMode failed");
     }
     session.modeId = params.modeId;
+    await persistSessionState(params.sessionId, session);
     return {};
   }
 
@@ -707,6 +864,7 @@ class MockAgent implements Agent {
       throw new Error("setSessionModel failed");
     }
     session.modelId = params.modelId;
+    await persistSessionState(params.sessionId, session);
     return {};
   }
 
@@ -736,6 +894,7 @@ class MockAgent implements Agent {
     } else {
       session.configValues[params.configId] = params.value;
     }
+    await persistSessionState(params.sessionId, session);
 
     return {
       configOptions: buildConfigOptions(session),
@@ -766,10 +925,72 @@ class MockAgent implements Agent {
 
   private async handlePrompt(
     sessionId: SessionId,
+    session: SessionState,
     text: string,
     signal: AbortSignal,
   ): Promise<string> {
     assertNotCancelled(signal);
+
+    const naturalLanguagePrompt = resolveNaturalLanguagePrompt(session, text);
+    if (naturalLanguagePrompt !== null) {
+      if (naturalLanguagePrompt === "timeout") {
+        await sleepWithCancel(2_000, signal);
+      }
+      return naturalLanguagePrompt;
+    }
+
+    if (text === "Count slowly from 1 to 100 and explain each number in one short sentence.") {
+      await sleepWithCancel(2_000, signal);
+      return "counted slowly";
+    }
+
+    if (text === "Write a medium paragraph about the history of clocks.") {
+      await sleepWithCancel(2_000, signal);
+      return "Mechanical clocks developed from earlier water and sundial timekeeping before spreading through medieval Europe and later becoming ever more precise through pendulums, springs, and modern standards.";
+    }
+
+    if (text === "Read ./package.json and reply with just the package name.") {
+      const filePath = resolve("./package.json");
+      const toolCallId = randomUUID();
+      await this.connection.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId,
+          title: "Read",
+          kind: "read",
+          status: "in_progress",
+          rawInput: {
+            filePath,
+          },
+        },
+      });
+
+      const readResult = await this.connection.readTextFile({
+        sessionId,
+        path: filePath,
+      });
+
+      await this.connection.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId,
+          title: "Read",
+          kind: "read",
+          status: "completed",
+          rawInput: {
+            filePath,
+          },
+          rawOutput: {
+            content: readResult.content,
+          },
+        },
+      });
+
+      const parsed = JSON.parse(readResult.content) as { name?: unknown };
+      return typeof parsed.name === "string" ? parsed.name : "";
+    }
 
     if (text.startsWith("echo ")) {
       return text.slice("echo ".length);
