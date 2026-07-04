@@ -366,7 +366,12 @@ test("AcpxRuntime falls back to plain runtimeSessionName handles and reuses a si
   await runtime.probeAvailability();
   assert.equal(runtime.isHealthy(), true);
   assert.deepEqual(runtime.getCapabilities(), {
-    controls: ["session/set_mode", "session/set_config_option", "session/status"],
+    controls: [
+      "session/set_mode",
+      "session/set_model",
+      "session/set_config_option",
+      "session/status",
+    ],
   });
 
   const plainHandle = {

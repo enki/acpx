@@ -16,7 +16,11 @@ import {
   trimConversationForRuntime,
 } from "../../session/conversation-model.js";
 import { defaultSessionEventLog } from "../../session/event-log.js";
-import { setDesiredModeId } from "../../session/mode-preference.js";
+import {
+  setCurrentModelId,
+  setDesiredModeId,
+  setDesiredModelId,
+} from "../../session/mode-preference.js";
 import type { ClientOperation, SessionRecord, SessionResumePolicy } from "../../types.js";
 import type {
   AcpRuntimeEvent,
@@ -765,6 +769,12 @@ export class AcpRuntimeManager {
         cwd: record.cwd,
         lastUsedAt: record.lastUsedAt,
         closed: record.closed === true,
+        ...(record.acpx?.current_model_id !== undefined
+          ? { currentModelId: record.acpx.current_model_id }
+          : {}),
+        ...(record.acpx?.available_models !== undefined
+          ? { availableModels: [...record.acpx.available_models] }
+          : {}),
         ...(record.acpx?.config_options !== undefined
           ? { configOptions: structuredClone(record.acpx.config_options) }
           : {}),
@@ -793,6 +803,33 @@ export class AcpRuntimeManager {
       targetRecord = result.record;
     }
     setDesiredModeId(targetRecord, mode);
+    await this.options.sessionStore.save(targetRecord);
+  }
+
+  async setModel(
+    handle: AcpRuntimeHandle,
+    model: string,
+    sessionMode: "persistent" | "oneshot" = "persistent",
+  ): Promise<void> {
+    const record = await this.requireRecord(handle.acpxRecordId ?? handle.sessionKey);
+    const controller = this.activeControllers.get(record.acpxRecordId);
+    let targetRecord = record;
+    if (controller) {
+      await controller.setSessionModel(model);
+    } else {
+      const result = await this.withRuntimeControlSession(
+        record,
+        sessionMode,
+        async ({ client, sessionId, record: connectedRecord }) => {
+          await client.setSessionModel(sessionId, model);
+          setDesiredModelId(connectedRecord, model);
+          setCurrentModelId(connectedRecord, model);
+        },
+      );
+      targetRecord = result.record;
+    }
+    setDesiredModelId(targetRecord, model);
+    setCurrentModelId(targetRecord, model);
     await this.options.sessionStore.save(targetRecord);
   }
 
